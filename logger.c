@@ -50,7 +50,7 @@ LogPostMessage(
     ULONG MessageLength;
 
     LogAcquireSpinLock(&LogMsgSpinLock, &Irql);
-    KeAcquireQueuedSpinLock(LockQueueIoDatabaseLock);
+
     if (NULL != LogMsgStorePool) {
         if (Length <= MSG_POOL_SIZE - LogMsgStoreLength) {
 
