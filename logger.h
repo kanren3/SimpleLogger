@@ -1,83 +1,53 @@
 #ifndef _LOGGER_H_
 #define _LOGGER_H_
 
-#ifdef __cplusplus
-extern "C" {
-#endif
+EXTERN_C_START
 
-#define MSG_UNICODE    0x00000001
-#define MSG_ANSI       0x00000002
+#define LOGGER_STATE_RUNING     0
+#define LOGGER_STATE_STOPPING   2
+#define LOGGER_STATE_STOPED     3
 
-#define MSG_POOL_SIZE  (PAGE_SIZE * 10)
+#define MSG_FORMAT_UNICODE  0
+#define MSG_FORMAT_ANSI     1
 
-    typedef struct _MESSAGE_HEADER {
-        LARGE_INTEGER Time;
-        ULONG Type;
-        ULONG Length;
-        UCHAR Body[1];
-    } MESSAGE_HEADER, * PMESSAGE_HEADER;
+#define MSG_POOL_MAX_LENGTH (32 * PAGE_SIZE)
 
-#define MESSAGE_HEADER_LENGTH \
-    FIELD_OFFSET(MESSAGE_HEADER, Body)
+typedef struct _MESSAGE_HEADER {
+    UINT32 Format;
+    UINT32 Length;
+    UCHAR Body[1];
+} MESSAGE_HEADER, *PMESSAGE_HEADER;
 
-#define GetMessageLength(Header) \
-    (MESSAGE_HEADER_LENGTH + Header->Length)
+#define MESSAGE_HEADER_LENGTH FIELD_OFFSET(MESSAGE_HEADER, Body)
 
-#define GetNextMessage(Header) \
-    ((PMESSAGE_HEADER)((PUCHAR)(Header) + GetMessageLength(Header)))
+#define GetMessageFullLength(Header) (MESSAGE_HEADER_LENGTH + Header->Length)
 
-#define IdlePoolToMessage(Pool, Length) \
-    ((PMESSAGE_HEADER)((PUCHAR)(Pool) + Length))
+#define GetNextMessage(Header) ((PMESSAGE_HEADER)((PUINT8)(Header) + GetMessageFullLength(Header)))
 
-#define LogMemoryCopy __movsb
+#define PoolToMessage(Buffer, Offset) ((PMESSAGE_HEADER)((PUCHAR)(Buffer) + Offset))
 
-#define LogNonPagePoolAlloca(NumberOfBytes) \
-    ExAllocatePoolWithTag(NonPagedPool, NumberOfBytes, 'LOG')
+VOID NTAPI
+LogSyncPrint (
+    IN PCSTR Format,
+    IN ...
+);
 
-#define LogPoolFree(Pointer) \
-    ExFreePoolWithTag(Pointer, 'LOG')
+VOID NTAPI
+LogPrint (
+    IN PCSTR Format,
+    IN ...
+);
 
-    typedef VOID
-        (NTAPI* MSG_HANDLER)(
-            __in PMESSAGE_HEADER Message);
+VOID NTAPI
+LogUninitialize (
+    VOID
+);
 
-    VOID NTAPI
-        LogPostMessage(
-            __in PVOID Data,
-            __in ULONG Type,
-            __in ULONG Length
-        );
+NTSTATUS NTAPI
+LogInitialize (
+    IN UINT32 FlushTime
+);
 
-    VOID NTAPI
-        LogUninitialize(
-            VOID
-        );
-
-    NTSTATUS NTAPI
-        LogInitialize(
-            __in ULONG FlushTime,
-            __in MSG_HANDLER Handler
-        );
-
-    VOID NTAPI
-        LogSyncPrint(
-            __in PCSTR Format,
-            __in ...
-        );
-
-    VOID NTAPI
-        LogAsyncPrint(
-            __in PCSTR Format,
-            __in ...
-        );
-
-    VOID NTAPI
-        LogDbgPrintHandler(
-            __in PMESSAGE_HEADER Message
-        );
-
-#ifdef __cplusplus
-}
-#endif
+EXTERN_C_END
 
 #endif

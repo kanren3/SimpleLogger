@@ -1,113 +1,145 @@
-#include "ntdefs.h"
+#include <definitions.h>
+#include "intrinsics.h"
+#include "runtime.h"
 #include "logger.h"
 
-ULONG LogMsgFlushTime = 0;
-ULONG LogMsgSpinLock = 0;
+UINT32 LogQueueLock;
+UINT32 LogFlushTime;
 
-PVOID LogMsgStorePool = NULL;
-ULONG LogMsgStoreLength = 0;
+PVOID LogPushPoolBuffer;
+PVOID LogPullPoolBuffer;
 
-PVOID LogMsgHandlerPool = NULL;
-ULONG LogMsgHandlerLength = 0;
+UINT32 LogPushPoolLength;
+UINT32 LogPullPoolLength;
 
-ULONG LogMsgWorkerState = 0;
-PETHREAD LogMsgWorkerThread = NULL;
-
-MSG_HANDLER LogMsgSingleHandler = NULL;
+UINT32 LogQueuerState;
+PETHREAD LogQueuerThread;
 
 VOID NTAPI
-LogAcquireSpinLock(
-    __inout volatile PULONG SpinLock,
-    __out PKIRQL Irql
+LogSyncPrint (
+    IN PCSTR Format,
+    IN ...
 )
 {
-    KeRaiseIrql(HIGH_LEVEL, Irql);
+    va_list ArgList;
 
-    while (InterlockedBitTestAndSet(SpinLock, 0)) {
-        YieldProcessor();
-    }
+    va_start(ArgList, Format);
+
+    vDbgPrintExWithPrefix("[mirror]\t",
+                          DPFLTR_IHVDRIVER_ID,
+                          DPFLTR_ERROR_LEVEL,
+                          Format,
+                          ArgList);
+
+    va_end(ArgList);
 }
 
 VOID NTAPI
-LogReleaseSpinLock(
-    __inout volatile PULONG SpinLock,
-    __in KIRQL Irql
+LogSendMessage (
+    IN PVOID Buffer,
+    IN UINT32 Length,
+    IN UINT32 Format
 )
 {
-    InterlockedAnd(SpinLock, 0);
-    KeLowerIrql(Irql);
-}
-
-VOID NTAPI
-LogPostMessage(
-    __in PVOID Data,
-    __in ULONG Type,
-    __in ULONG Length
-)
-{
+    PMESSAGE_HEADER Message = NULL;
     KIRQL Irql;
-    PMESSAGE_HEADER Message;
-    ULONG MessageLength;
 
-    LogAcquireSpinLock(&LogMsgSpinLock, &Irql);
+    RtAcquireSpinLock(&LogQueueLock, &Irql);
 
-    if (NULL != LogMsgStorePool) {
-        if (Length <= MSG_POOL_SIZE - LogMsgStoreLength) {
+    if (NULL != LogPushPoolBuffer) {
+        if (LogPushPoolLength < MSG_POOL_MAX_LENGTH) {
+            if ((Length + MESSAGE_HEADER_LENGTH) <= (MSG_POOL_MAX_LENGTH - LogPushPoolLength)) {
+                Message = PoolToMessage(LogPushPoolBuffer, LogPushPoolLength);
+                Message->Format = Format;
+                Message->Length = Length;
 
-            Message = IdlePoolToMessage(
-                LogMsgStorePool, LogMsgStoreLength);
-
-            Message->Type = Type;
-            Message->Length = Length;
-            KeQuerySystemTime(&Message->Time);
-            LogMemoryCopy(Message->Body, Data, Length);
-
-            MessageLength = Length + MESSAGE_HEADER_LENGTH;
-            LogMsgStoreLength += MessageLength;
+                RtlCopyMemory(Message->Body, Buffer, Length);
+                LogPushPoolLength += GetMessageFullLength(Message);
+            }
         }
     }
 
-    LogReleaseSpinLock(&LogMsgSpinLock, Irql);
+    RtReleaseSpinLock(&LogQueueLock, Irql);
 }
 
 VOID NTAPI
-LogMsgMultipleHandler(
-    VOID
+LogPrint (
+    IN PCSTR Format,
+    IN ...
 )
 {
-    PMESSAGE_HEADER Message;
+    va_list ArgList;
+    CHAR Buffer[512];
+    UINT Length;
 
-    Message = LogMsgHandlerPool;
+    va_start(ArgList, Format);
 
-    while (0 != LogMsgHandlerLength) {
-        LogMsgSingleHandler(Message);
-        LogMsgHandlerLength -= GetMessageLength(Message);
+    Length = _vsnprintf(Buffer, sizeof(Buffer), Format, ArgList);
+
+    LogSendMessage(Buffer, Length + 1, MSG_FORMAT_ANSI);
+
+    va_end(ArgList);
+}
+
+VOID NTAPI
+LogMsgPrintCallback (
+    IN PMESSAGE_HEADER Message
+)
+{
+    switch (Message->Format) {
+    case MSG_FORMAT_ANSI:
+        LogSyncPrint("%s", Message->Body);
+        break;
+    case MSG_FORMAT_UNICODE:
+        LogSyncPrint("%ws", Message->Body);
+        break;
+    }
+}
+
+VOID NTAPI
+LogMsgHandler (
+    IN PVOID PoolBuffer,
+    IN UINT32 PoolLength
+)
+{
+    PMESSAGE_HEADER Message = NULL;
+
+    Message = LogPullPoolBuffer;
+
+    while (0 != LogPullPoolLength) {
+        LogMsgPrintCallback(Message);
+        LogPullPoolLength -= GetMessageFullLength(Message);
         Message = GetNextMessage(Message);
     }
 }
 
 VOID NTAPI
-LogMsgWorker(
-    __in PVOID StartContext
+LogMsgQueuer (
+    IN PVOID StartContext
 )
 {
-    KIRQL Irql;
     LARGE_INTEGER Interval;
+    KIRQL Irql;
 
-    while (0 == LogMsgWorkerState) {
-        LogAcquireSpinLock(&LogMsgSpinLock, &Irql);
-        LogMsgHandlerLength = LogMsgStoreLength;
+    while (LogQueuerState != LOGGER_STATE_STOPED) {
+        InterlockedCompareExchange(&LogQueuerState,
+                                   LOGGER_STATE_STOPED,
+                                   LOGGER_STATE_STOPPING);
 
-        LogMemoryCopy(LogMsgHandlerPool,
-                      LogMsgStorePool,
-                      LogMsgStoreLength);
+        RtAcquireSpinLock(&LogQueueLock, &Irql);
 
-        LogMsgStoreLength = 0;
-        LogReleaseSpinLock(&LogMsgSpinLock, Irql);
+        LogPullPoolLength = LogPushPoolLength;
+        LogPushPoolLength = 0;
 
-        LogMsgMultipleHandler();
+        RtlCopyMemory(LogPullPoolBuffer,
+                      LogPushPoolBuffer,
+                      LogPullPoolLength);
 
-        Interval.QuadPart = Int32x32To64(LogMsgFlushTime, -10000);
+        RtReleaseSpinLock(&LogQueueLock, Irql);
+
+        LogMsgHandler(LogPullPoolBuffer, LogPullPoolLength);
+
+        Interval.QuadPart = Int32x32To64(LogFlushTime, -10 * 1000);
         KeDelayExecutionThread(KernelMode, TRUE, &Interval);
     }
 
@@ -115,62 +147,68 @@ LogMsgWorker(
 }
 
 VOID NTAPI
-LogUninitialize(
+LogUninitialize (
     VOID
 )
 {
+    NTSTATUS Status;
     KIRQL Irql;
-    PVOID MsgStorePool, MsgHandlerPool;
+    PVOID PushPoolBuffer;
+    PVOID PullPoolBuffer;
 
-    if (NULL != LogMsgWorkerThread) {
-        InterlockedExchange(&LogMsgWorkerState, 1);
-        KeAlertThread(LogMsgWorkerThread, KernelMode);
+    InterlockedExchange(&LogQueuerState, LOGGER_STATE_STOPPING);
+    KeAlertThread(LogQueuerThread, KernelMode);
 
-        KeWaitForSingleObject(LogMsgWorkerThread,
-                              Executive,
-                              KernelMode,
-                              FALSE,
-                              NULL);
+    Status = KeWaitForSingleObject(LogQueuerThread,
+                                   Executive,
+                                   KernelMode,
+                                   FALSE,
+                                   NULL);
 
-        MsgStorePool = LogMsgStorePool;
-        MsgHandlerPool = LogMsgHandlerPool;
+    ObDereferenceObject(LogQueuerThread);
+    LogQueuerThread = NULL;
 
-        LogAcquireSpinLock(&LogMsgSpinLock, &Irql);
-        LogMsgHandlerPool = LogMsgStorePool = NULL;
-        LogReleaseSpinLock(&LogMsgSpinLock, Irql);
+    RtAcquireSpinLock(&LogQueueLock, &Irql);
 
-        LogPoolFree(MsgHandlerPool);
-        LogPoolFree(MsgStorePool);
-    }
+    PushPoolBuffer = LogPushPoolBuffer;
+    PullPoolBuffer = LogPullPoolBuffer;
+
+    LogPushPoolBuffer = NULL;
+    LogPullPoolBuffer = NULL;
+
+    RtReleaseSpinLock(&LogQueueLock, Irql);
+
+    RtFreeMemory(PushPoolBuffer);
+    RtFreeMemory(PullPoolBuffer);
 }
 
 NTSTATUS NTAPI
-LogInitialize(
-    __in ULONG FlushTime,
-    __in MSG_HANDLER Handler
+LogInitialize (
+    IN UINT32 FlushTime
 )
 {
     NTSTATUS Status;
     OBJECT_ATTRIBUTES ObjectAttributes;
     HANDLE ThreadHandle;
 
-    LogMsgFlushTime = FlushTime;
-    LogMsgSpinLock = 0;
-    LogMsgStoreLength = 0;
-    LogMsgHandlerLength = 0;
-    LogMsgWorkerState = 0;
-    LogMsgSingleHandler = Handler;
+    LogQueuerState = LOGGER_STATE_RUNING;
+    LogPushPoolLength = 0;
+    LogPullPoolLength = 0;
 
-    LogMsgStorePool = LogNonPagePoolAlloca(MSG_POOL_SIZE);
+    LogFlushTime = FlushTime;
 
-    if (NULL == LogMsgStorePool) {
+    RtInitializeSpinLock(&LogQueueLock);
+
+    LogPushPoolBuffer = RtAllocateMemory(MSG_POOL_MAX_LENGTH);
+
+    if (NULL == LogPushPoolBuffer) {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    LogMsgHandlerPool = LogNonPagePoolAlloca(MSG_POOL_SIZE);
+    LogPullPoolBuffer = RtAllocateMemory(MSG_POOL_MAX_LENGTH);
 
-    if (NULL == LogMsgHandlerPool) {
-        LogPoolFree(LogMsgStorePool);
+    if (NULL == LogPullPoolBuffer) {
+        RtFreeMemory(LogPushPoolBuffer);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -181,12 +219,16 @@ LogInitialize(
                                   &ObjectAttributes,
                                   NULL,
                                   NULL,
-                                  LogMsgWorker,
+                                  LogMsgQueuer,
                                   NULL);
 
     if (FALSE == NT_SUCCESS(Status)) {
-        LogPoolFree(LogMsgHandlerPool);
-        LogPoolFree(LogMsgStorePool);
+        RtFreeMemory(LogPushPoolBuffer);
+        RtFreeMemory(LogPullPoolBuffer);
+
+        LogPushPoolBuffer = NULL;
+        LogPullPoolBuffer = NULL;
+
         return Status;
     }
 
@@ -194,68 +236,10 @@ LogInitialize(
                               SYNCHRONIZE,
                               NULL,
                               KernelMode,
-                              &LogMsgWorkerThread,
+                              &LogQueuerThread,
                               NULL);
 
     ZwClose(ThreadHandle);
+
     return STATUS_SUCCESS;
-}
-
-VOID NTAPI
-LogSyncPrint(
-    __in PCSTR Format,
-    __in ...
-)
-{
-    va_list ArgList;
-
-    va_start(ArgList, Format);
-
-    vDbgPrintExWithPrefix("[logger]\t",
-                          DPFLTR_IHVDRIVER_ID,
-                          DPFLTR_ERROR_LEVEL,
-                          Format,
-                          ArgList);
-
-    va_end(ArgList);
-}
-
-VOID NTAPI
-LogAsyncPrint(
-    __in PCSTR Format,
-    __in ...
-)
-{
-    va_list ArgList;
-    char Buffer[512];
-    int Length;
-
-    va_start(ArgList, Format);
-
-    Length = _vsnprintf(Buffer, sizeof(Buffer), Format, ArgList);
-
-    va_end(ArgList);
-
-    if (-1 == Length || sizeof(Buffer) == Length) {
-        Buffer[sizeof(Buffer) - 1] = '\0';
-        LogPostMessage(Buffer, MSG_ANSI, sizeof(Buffer));
-    }
-    else {
-        LogPostMessage(Buffer, MSG_ANSI, Length + 1);
-    }
-}
-
-VOID NTAPI
-LogDbgPrintHandler(
-    __in PMESSAGE_HEADER Message
-)
-{
-    switch (Message->Type) {
-    case MSG_UNICODE:
-        LogSyncPrint("%ws", Message->Body);
-        break;
-    case MSG_ANSI:
-        LogSyncPrint("%s", Message->Body);
-        break;
-    }
 }
